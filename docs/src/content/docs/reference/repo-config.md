@@ -280,6 +280,109 @@ These checks run on whichever copy of the file is parsed, including the pushed b
 
 Like `document.instructions`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands): a value present only on a pushed branch is ignored, so a contributor cannot inject instructions into the review that gates them.
 
+### pr
+
+Configurable PR title and description template. With `pr:` absent, the PR step's built-in composer runs unchanged: a conventional-commit title, `## What Changed`, `## Intent`, `## Risk Assessment`, `## Testing`, and `## Pipeline`, in that fixed order.
+
+| | |
+|---|---|
+| Type | `object` (see below) |
+| Default | Absent (built-in composer, unchanged) |
+
+```yaml
+pr:
+  title:
+    template: "{{ Jira Ticket ID }}: {{ Overall PR title, imperative, no trailing period }}"
+    max_chars: 100
+    conventional: false
+    strict: true
+    must_match: '^[A-Z]{2,10}-[0-9]+: .+'
+  labels: ["automated", "needs-review"]
+  draft: false
+  on_agent_failure: fallback
+  sections:
+    - id: whats_changed
+      heading: "What's Changed"
+      required: true
+      max_chars: 1500
+      content: |
+        {{ 3-6 bullet points describing the concrete behavior and code changes
+        in this branch, derived from the final diff. }}
+    - id: sister_prs
+      heading: "Sister PRs"
+      required: false
+      content: |
+        {{ Links to any related pull requests this change depends on, if
+        named in the commit messages, branch name, or recorded intent. }}
+    - source: pipeline.testing
+    - source: pipeline.risk
+    - source: pipeline.summary
+```
+
+`{{ bracketed text }}` is a natural-language instruction to the drafting agent, which replaces the whole placeholder with a concrete value; there is no variable table and no enumerated set of supported placeholders. Literal text outside `{{ }}` is preserved verbatim, except that punctuation immediately next to an unresolved placeholder is dropped along with it, so a branch with no ticket ID publishes `Unify targeting rule limits`, never `: Unify targeting rule limits`.
+
+An identifier-shaped value (short, no internal whitespace, containing a digit) must appear verbatim somewhere in the branch name, commit messages, or recorded intent, or it is treated as unresolved; this keeps a hallucinated ticket ID from ever reaching a published title or body. Prose values are never checked this way.
+
+#### pr.title
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `template` | `string` | empty | The title specification. Empty means no title template; the drafted title publishes through the existing conventional-commit path. |
+| `max_chars` | `int` | 200 (ceiling) | Truncates the final rendered title at a line boundary. |
+| `conventional` | `bool` | `false` when `template` is set, `true` otherwise | Whether the existing conventional-commit rewrite (which prepends `chore: ` to anything not already in `type(scope): subject` form) runs over the final title. |
+| `strict` | `bool` | `true` | An unresolved placeholder in the title re-asks the agent once, then fails the PR step, instead of eliding. |
+| `must_match` | `string` (regex) | unset (no check) | The published title (after substitution, elision, `conventional`, and truncation) must match this pattern, or the PR step fails after one re-ask. Compiled at config load; an invalid pattern is a load-time error. |
+
+#### pr.sections
+
+An ordered list; the order here is the order in the rendered body. Each entry carries either `content:` (agent-filled) or `source:` (a deterministic, pipeline-generated block), never both.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `id` | `string` | Optional identifier, used in error messages and as the JSON-schema key prefix for its placeholders. |
+| `heading` | `string` | The `##` heading text. Overridable even for a `source:` section; the deterministic content it renders never changes. |
+| `required` | `bool` | Default `false`. An unresolved slot in a `required: true` section re-asks once, then fails the PR step. An unresolved slot in an optional section elides; if the whole section ends up empty, it drops entirely, heading included. |
+| `max_chars` | `int` | Truncates a `content:` section's rendered body at a line boundary. |
+| `content` | `string` (multiline) | Natural-language template text with `{{ }}` placeholders. |
+| `source` | `string` | One of `run.intent`, `pipeline.risk`, `pipeline.testing`, `pipeline.summary`, `pipeline`. |
+
+`source:` values:
+
+| `source:` | Renders | Omittable |
+|---|---|---|
+| `run.intent` | The recorded `--intent` text, verbatim | yes |
+| `pipeline.risk` | The review step's risk line | yes |
+| `pipeline.testing` | The test step's testing summary | yes |
+| `pipeline.summary` | The no-mistakes signature and machine-readable step attestation, no narrative | **no** |
+| `pipeline` | The above, plus the collapsible per-step narrative | **no** |
+
+Exactly one of `pipeline` or `pipeline.summary` must appear whenever `sections:` is configured at all: this is the evidence floor, and omitting both is a config validation error rather than a silent append. It exists because two consumers depend on it regardless of what a repository configures: an upstream-style required check that greps for the signature line, and any tool that parses the attestation comment for compliance evidence. `mode:` (a future rewritten-intent variant) is not a supported key.
+
+#### pr.labels and pr.draft
+
+Applied at PR creation only, on providers that support them (currently GitHub). `labels` are added via a separate, non-fatal call after creation, so a label that does not exist in the repository logs a note rather than discarding an otherwise-complete run's PR. `draft` is create-only; an existing PR's draft state is never reconciled on update. A provider without the capability logs a note and skips the affordance rather than failing the step.
+
+```yaml
+pr:
+  labels: ["automated"]
+  draft: false
+```
+
+#### pr.on_agent_failure
+
+| | |
+|---|---|
+| Type | `string`: `fallback` or `fail` |
+| Default | `fallback` |
+
+Governs what happens when the drafting agent invocation itself produces no usable answer at all (crash, timeout, or schema-invalid output after one re-ask) - not the same as an unresolved placeholder (`strict`) or a wrong-shaped title (`must_match`).
+
+`fallback` keeps today's deterministic fallback body and lets the run continue; with a template configured it also appends one marker line noting the template could not be applied, so the fallback is never indistinguishable from a drafted body. `fail` fails the PR step with a finding instead, and leaves an existing PR body untouched on update. A cancelled run is not routed through either branch.
+
+#### Trust
+
+The whole `pr:` namespace is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands): `pr.sections[].content` is natural-language text injected into a gate agent's prompt (the same prompt-injection surface `review.path_instructions` guards against), `pr.title.must_match` decides whether a run fails, and `pr.labels` writes to the forge. A pushed branch cannot configure any of it.
+
 ### Command process lifetime
 
 All configured `commands.*` entries are scoped to their step.

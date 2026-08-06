@@ -408,6 +408,10 @@ If `dir` is absolute, escapes the worktree, points into `.git`, crosses a symlin
 
 These are global defaults. Per-repo config can override either field.
 
+### pr
+
+Sets your own default PR title/description template for every repo that configures none of its own. See [`pr` in the repo config reference](/reference/repo-config/#pr) for the full schema; `title` and `sections` each replace wholesale at whichever level (global or repo) configures either, while `labels`, `draft`, and `on_agent_failure` merge per field with the repo's value winning. Unlike the repo-config copy, this one is not subject to the trusted-default-branch restriction - it is your own machine's setting.
+
 ## Environment variables
 
 See [Environment Variables](/no-mistakes/reference/environment/) for `NM_HOME`, `NM_DAEMON_CONNECT_TIMEOUT`, Bitbucket Cloud credentials, and update-check suppression.

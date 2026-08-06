@@ -12,9 +12,19 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/prtemplate"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+// prTemplate returns the resolved pr: template for this run, or nil when
+// neither level configured one - the config-absent guarantee.
+func prTemplate(sctx *pipeline.StepContext) *prtemplate.Template {
+	if sctx == nil || sctx.Config == nil || sctx.Config.PR == nil {
+		return nil
+	}
+	return sctx.Config.PR.Template
+}
 
 // PRStep creates or updates a pull request via the provider CLI or API.
 type PRStep struct{}
@@ -81,6 +91,8 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	if err != nil {
 		return nil, err
 	}
+	scmContent := scm.PRContent{Title: content.Title, Body: content.Body}
+	applyPRMetadata(sctx, host, &scmContent)
 
 	sctx.Log(fmt.Sprintf("checking for existing pull request on branch %s...", branch))
 	existing, err := host.FindPR(ctx, branch, sctx.Repo.DefaultBranch)
@@ -89,7 +101,7 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	}
 	if existing != nil {
 		sctx.Log(fmt.Sprintf("pull request already exists: %s, updating...", describePR(existing)))
-		updated, err := host.UpdatePR(ctx, existing, scm.PRContent(content))
+		updated, err := host.UpdatePR(ctx, existing, scmContent)
 		if err != nil {
 			sctx.Log(fmt.Sprintf("warning: failed to update PR: %v", err))
 			updated = existing
@@ -104,7 +116,7 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	}
 
 	sctx.Log("creating pull request...")
-	created, err := host.CreatePR(ctx, branch, sctx.Repo.DefaultBranch, scm.PRContent(content))
+	created, err := host.CreatePR(ctx, branch, sctx.Repo.DefaultBranch, scmContent)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +128,33 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		slog.Warn("failed to persist PR URL", "run", sctx.Run.ID, "url", created.URL, "err", err)
 	}
 	return &pipeline.StepOutcome{PRURL: created.URL}, nil
+}
+
+// applyPRMetadata sets Labels and Draft on content from the resolved pr:
+// config (Decision 7), gated on the provider's declared Capabilities. A
+// provider that does not support one of the two affordances gets a step note
+// instead of a silent no-op or a failure - the same posture GetMergeableState
+// and FetchFailedCheckLogs already use for optional Host methods.
+func applyPRMetadata(sctx *pipeline.StepContext, host scm.Host, content *scm.PRContent) {
+	if sctx.Config == nil || sctx.Config.PR == nil {
+		return
+	}
+	pr := sctx.Config.PR
+	caps := host.Capabilities()
+	if len(pr.Labels) > 0 {
+		if caps.PRLabels {
+			content.Labels = pr.Labels
+		} else {
+			sctx.Log(fmt.Sprintf("pr.labels configured but %s does not support PR labels; skipping", host.Provider()))
+		}
+	}
+	if pr.Draft {
+		if caps.PRDraft {
+			content.Draft = true
+		} else {
+			sctx.Log(fmt.Sprintf("pr.draft configured but %s does not support draft PRs; skipping", host.Provider()))
+		}
+	}
 }
 
 func describePR(pr *scm.PR) string {
@@ -132,6 +171,21 @@ func describePR(pr *scm.PR) string {
 }
 
 func (s *PRStep) buildPRContent(sctx *pipeline.StepContext, branch, baseSHA string, bodyLimit int) (prContent, error) {
+	// Config-absent guarantee: with no pr: template configured anywhere,
+	// tmpl is nil and every line below this point is the unmodified legacy
+	// composer. A template that configures pr.sections (or a title
+	// template's own {{ }} placeholders, which need slot-level structured
+	// output the legacy {title,body} schema cannot express) is fully owned
+	// by buildTemplatedPRContent instead. A template that configures only
+	// bare title policy (conventional/strict/must_match with no template
+	// text and no sections) stays on this legacy path: the body composition
+	// below is untouched, and only the title post-processing after the
+	// agent call differs.
+	tmpl := prTemplate(sctx)
+	if tmpl != nil && (tmpl.HasSections() || len(tmpl.Title.Segments) > 0) {
+		return s.buildTemplatedPRContent(sctx, tmpl, branch, baseSHA, bodyLimit)
+	}
+
 	ctx := sctx.Ctx
 	diffStat, _ := git.Run(ctx, sctx.WorkDir, "diff", "--stat", baseSHA+".."+sctx.Run.HeadSHA)
 	finalDiff, err := git.Run(ctx, sctx.WorkDir, "diff", "--name-status", baseSHA+".."+sctx.Run.HeadSHA)
@@ -162,42 +216,56 @@ Diff stat:
 %s
 
 Final diff paths and statuses:
-%s%s%s`, branch, baseSHA, sctx.Run.HeadSHA, sctx.Repo.DefaultBranch, conventional.ReleaseTypeRule, diffStat, finalDiff, userIntentPromptSection(sctx), executionContextPromptSection())
+%s%s%s`, branch, baseSHA, sctx.Run.HeadSHA, sctx.Repo.DefaultBranch, conventional.ReleaseTypeRule, diffStat, finalDiff, descriptionIntentPromptSection(sctx), executionContextPromptSection())
 
 	prompt += prBodyBudgetPromptSection(bodyLimit)
 
-	result, err := sctx.Agent.Run(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: prContentSchema,
-		OnChunk:    sctx.LogChunk,
-	})
-	if err != nil {
-		slog.Warn("agent failed for PR content, using fallback", "error", err)
-		return fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, bodyLimit), nil
-	}
+	basePrompt := prompt
+	for attempt := 1; attempt <= 2; attempt++ {
+		result, err := sctx.Agent.Run(ctx, agent.RunOpts{
+			Prompt:     prompt,
+			CWD:        sctx.WorkDir,
+			JSONSchema: prContentSchema,
+			OnChunk:    sctx.LogChunk,
+		})
+		if err != nil {
+			slog.Warn("agent failed for PR content, using fallback", "error", err)
+			return fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, bodyLimit), nil
+		}
 
-	var content prContent
-	if result.Output != nil {
-		if err := json.Unmarshal(result.Output, &content); err == nil {
-			content.Title = strings.TrimSpace(content.Title)
-			content.Body = strings.TrimSpace(content.Body)
-			content.Body = unwrapNestedPRBody(content.Body)
-			content.Body = stripGeneratedSections(content.Body)
-			if content.Title != "" && content.Body != "" {
-				originalTitle := content.Title
-				content.Title = conventional.TightenTitle(content.Title)
-				if content.Title != originalTitle {
-					slog.Warn("tightened agent PR title type", "from", originalTitle, "to", content.Title)
+		var content prContent
+		if result.Output != nil {
+			if err := json.Unmarshal(result.Output, &content); err == nil {
+				content.Title = strings.TrimSpace(content.Title)
+				content.Body = strings.TrimSpace(content.Body)
+				content.Body = unwrapNestedPRBody(content.Body)
+				content.Body = stripGeneratedSections(content.Body)
+				if content.Title != "" && content.Body != "" {
+					if tmpl == nil || tmpl.Title.Conventional {
+						originalTitle := content.Title
+						content.Title = conventional.TightenTitle(content.Title)
+						if content.Title != originalTitle {
+							slog.Warn("tightened agent PR title type", "from", originalTitle, "to", content.Title)
+						}
+					}
+					if tmpl != nil && tmpl.Title.MustMatch != nil && !tmpl.Title.MustMatch.Pattern.MatchString(content.Title) {
+						if attempt == 1 {
+							prompt = basePrompt + fmt.Sprintf("\n\nYour previous title %q did not match the required pattern %q. Return a title that does.", content.Title, tmpl.Title.MustMatch.Raw)
+							continue
+						}
+						return prContent{}, fmt.Errorf("pr: title %q does not match pr.title.must_match %q", content.Title, tmpl.Title.MustMatch.Raw)
+					}
+					if bodyLimit > 0 {
+						content.Body = assemblePRBody(sctx, content.Body, riskLine, testingMD, pipelineMD, bodyLimit)
+					} else {
+						content.Body = buildPRBody(content.Body, riskLine, testingMD, pipelineMD, sctx)
+					}
+					return content, nil
 				}
-				if bodyLimit > 0 {
-					content.Body = assemblePRBody(sctx, content.Body, riskLine, testingMD, pipelineMD, bodyLimit)
-				} else {
-					content.Body = buildPRBody(content.Body, riskLine, testingMD, pipelineMD, sctx)
-				}
-				return content, nil
 			}
 		}
+
+		return fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, bodyLimit), nil
 	}
 
 	return fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, bodyLimit), nil
@@ -226,6 +294,13 @@ func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext) (pipelineMD, r
 
 	pipelineMD, riskLine = BuildPipelineSummary(steps, rounds, sctx.Run.HeadSHA)
 	testingMD = BuildTestingSummaryForPR(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir)
+	if sctx.Config != nil && sctx.Config.PR != nil && sctx.Config.PR.PipelineSummaryOnly {
+		// #601 compatibility alias (bug-fixed): drop only the <details>
+		// narrative, never the signature or the #670 attestation - both stay
+		// in the fixed header splitPipelineSectionHeader already carves out.
+		header, _ := splitPipelineSectionHeader(pipelineMD)
+		pipelineMD = strings.TrimRight(header, "\n")
+	}
 	return pipelineMD, riskLine, testingMD
 }
 
