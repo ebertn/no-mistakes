@@ -95,6 +95,15 @@ type PR struct {
 type PRContent struct {
 	Title string
 	Body  string
+	// Labels are applied at PR creation only (pr.labels, Decision 7). An
+	// empty slice means "apply none", never "clear existing" - it is never
+	// reconciled against an existing PR's labels on update.
+	Labels []string
+	// Draft requests the PR be opened as a draft (pr.draft, Decision 7).
+	// Honored on create only; an existing PR's draft state is never
+	// reconciled on update (GitHub's undraft is a separate verb, not a
+	// field `gh pr edit` can set).
+	Draft bool
 }
 
 // PRState is the normalized lifecycle state of a PR.
@@ -163,6 +172,12 @@ func (c Check) Pending() bool { return c.Bucket == CheckBucketPending }
 type Capabilities struct {
 	MergeableState  bool
 	FailedCheckLogs bool
+	// PRLabels and PRDraft declare whether this provider honors
+	// PRContent.Labels and PRContent.Draft (Decision 7). A provider without
+	// the capability reports the affordance as unsupported via a step note
+	// rather than failing or silently doing nothing.
+	PRLabels bool
+	PRDraft  bool
 }
 
 // ErrUnsupported is returned by optional Host methods that the provider

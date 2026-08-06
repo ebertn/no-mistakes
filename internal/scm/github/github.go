@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os/exec"
 	"strings"
@@ -159,7 +160,7 @@ func repoOwner(slug string) string {
 func (h *Host) Provider() scm.Provider { return scm.ProviderGitHub }
 
 func (h *Host) Capabilities() scm.Capabilities {
-	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true}
+	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true, PRLabels: true, PRDraft: true}
 }
 
 func (h *Host) Available(ctx context.Context) error {
@@ -248,6 +249,12 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
 		"--base", base,
 	}, h.repoArgs()...)
 	args = append(args, "--title", content.Title, "--body-file", "-")
+	// --draft is create-only: GitHub's undraft is the separate `gh pr ready`
+	// verb, not a field `gh pr edit` can set, so draft state is never
+	// reconciled on update.
+	if content.Draft {
+		args = append(args, "--draft")
+	}
 	cmd := h.cmd(ctx, "gh", args...)
 	cmd.Stdin = strings.NewReader(content.Body)
 	out, err := cmd.CombinedOutput()
@@ -259,7 +266,35 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
 	if num, nerr := scm.ExtractPRNumber(url); nerr == nil {
 		pr.Number = num
 	}
+	// Labels are applied via a separate, non-fatal call: `gh pr create
+	// --label` fails the whole creation if a label does not exist in the
+	// repo, and a typo in pr.labels is a config mistake, not a reason to
+	// throw away a completed pipeline run's PR.
+	if len(content.Labels) > 0 {
+		if err := h.applyLabels(ctx, pr, content.Labels); err != nil {
+			slog.Warn("gh pr edit --add-label failed; the PR was created without the configured labels", "pr", pr.URL, "labels", content.Labels, "error", err)
+		}
+	}
 	return pr, nil
+}
+
+// applyLabels adds labels to an existing PR via the shared prSelector, so it
+// never falls back to a cwd-inferred branch (the bare-gate-repo trap
+// documented on prSelector).
+func (h *Host) applyLabels(ctx context.Context, pr *scm.PR, labels []string) error {
+	selector, err := prSelector(pr)
+	if err != nil {
+		return err
+	}
+	args := append([]string{"pr", "edit", selector}, h.repoArgs()...)
+	for _, label := range labels {
+		args = append(args, "--add-label", label)
+	}
+	cmd := h.cmd(ctx, "gh", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh pr edit --add-label: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) (*scm.PR, error) {
