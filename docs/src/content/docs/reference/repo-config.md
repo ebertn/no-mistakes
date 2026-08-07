@@ -321,7 +321,24 @@ pr:
 
 `{{ bracketed text }}` is a natural-language instruction to the drafting agent, which replaces the whole placeholder with a concrete value; there is no variable table and no enumerated set of supported placeholders. Literal text outside `{{ }}` is preserved verbatim, except that punctuation immediately next to an unresolved placeholder is dropped along with it, so a branch with no ticket ID publishes `Unify targeting rule limits`, never `: Unify targeting rule limits`.
 
+This is a different use of `{{ }}` than [`commit.fix_message`](/no-mistakes/reference/global-config/#commitfix_message)'s `{{.Step}}` / `{{.Summary}}`: those are variable lookups resolved from a fixed data model (the leading `.` marks a field reference), while a `pr:` placeholder is a free-form brief an agent reads and answers in prose. The two conventions share a delimiter but are otherwise unrelated - a `pr:` template does not have access to `.Step`/`.Summary`, and `commit.fix_message` does not accept a natural-language brief.
+
 An identifier-shaped value (short, no internal whitespace, containing a digit) must appear verbatim somewhere in the branch name, commit messages, or recorded intent, or it is treated as unresolved; this keeps a hallucinated ticket ID from ever reaching a published title or body. Prose values are never checked this way.
+
+#### Escaping a literal `{{`
+
+A backslash immediately before `{{` escapes it, following the same convention as Handlebars (`\{{`): that occurrence opens no placeholder, and `{{` publishes as literal text instead. This matters most when a template quotes or documents another `{{ }}` convention - for example, a `pr:` section that explains this repository's `commit.fix_message` setting:
+
+```yaml
+content: |
+  This repo's auto-fix commits use \{{.Step}}/\{{.Summary}} for their subject line.
+```
+
+Without the backslash, `{{.Step}}` would silently open its own placeholder and become a phantom slot the drafting agent has to answer, rather than text describing someone else's template.
+
+Escaping uses standard backslash-run parity, the same rule a shell or regex uses for its own escape character: the run of consecutive backslashes immediately before `{{` is counted, an **odd** count escapes (one backslash is consumed, the rest publish literally, and `{{` publishes literally), and an **even** count does not (every backslash publishes literally and `{{` still opens a real placeholder). So `\{{` is a literal `{{`, and `\\{{ ticket }}` is a literal backslash followed by a real placeholder - not a second escape. A backslash anywhere else in a template is ordinary literal text and is never inspected; only a run immediately adjacent to `{{` matters, so Windows paths, regex patterns, and other unrelated backslashes in a brief or literal section are untouched.
+
+An escaped opener still requires its own real placeholders elsewhere in the template to close normally: `\{{ escaped, then a real {{ unclosed` still fails with an unclosed-`{{` config error, because only the second, unescaped `{{` was ever a placeholder attempt.
 
 #### pr.title
 

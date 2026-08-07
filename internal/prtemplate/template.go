@@ -136,21 +136,54 @@ func (t *Template) Slots() []*Slot {
 // literal and slot segments, in order. keyPrefix names the slots
 // "<keyPrefix>_1", "<keyPrefix>_2", ... in the order they appear. Rejects an
 // unclosed "{{" and a brief that is empty or all whitespace once trimmed.
+//
+// A backslash immediately before "{{" escapes it (the Handlebars \{{
+// convention): that occurrence opens no placeholder, one backslash is
+// consumed, and "{{" is emitted as literal text - so a template that wants
+// to publish a literal "{{" (or that merely documents another {{ }}
+// convention, such as commit.fix_message's {{.Step}}) does not silently grow
+// a phantom slot. Escaping uses standard backslash-run parity, exactly like
+// a shell or regex escaping its own metacharacter: the run of consecutive
+// backslashes immediately before "{{" is counted, an ODD count escapes (one
+// backslash consumed, the rest published literally) and an EVEN count does
+// not (every backslash published literally, "{{" still opens a placeholder)
+// - so "\\{{ x }}" is a literal backslash followed by a real placeholder, not
+// a second escape. A backslash anywhere else is ordinary literal text,
+// untouched; only a run immediately adjacent to "{{" is ever inspected, so
+// this cannot become ambiguous with unrelated backslashes elsewhere in the
+// brief or literal text (Windows paths, regexes, ...).
 func parseSegments(text, keyPrefix string) ([]Segment, error) {
 	var segments []Segment
+	var literal strings.Builder
 	rest := text
 	n := 0
 	for {
 		start := strings.Index(rest, "{{")
 		if start < 0 {
-			if rest != "" {
-				segments = append(segments, Segment{Literal: rest})
-			}
+			literal.WriteString(rest)
 			break
 		}
-		if start > 0 {
-			segments = append(segments, Segment{Literal: rest[:start]})
+
+		backslashes := 0
+		for backslashes < start && rest[start-1-backslashes] == '\\' {
+			backslashes++
 		}
+		if backslashes%2 == 1 {
+			// Odd run: escaped. Everything before the run, then the run minus
+			// its final (consumed) backslash, then a literal "{{".
+			literal.WriteString(rest[:start-backslashes])
+			literal.WriteString(strings.Repeat(`\`, backslashes-1))
+			literal.WriteString("{{")
+			rest = rest[start+len("{{"):]
+			continue
+		}
+
+		literal.WriteString(rest[:start])
+		if literal.Len() > 0 {
+			segments = append(segments, Segment{Literal: literal.String()})
+			literal.Reset()
+		}
+
 		afterOpen := rest[start+len("{{"):]
 		end := strings.Index(afterOpen, "}}")
 		if end < 0 {
@@ -166,6 +199,9 @@ func parseSegments(text, keyPrefix string) ([]Segment, error) {
 			Brief: brief,
 		}})
 		rest = afterOpen[end+len("}}"):]
+	}
+	if literal.Len() > 0 {
+		segments = append(segments, Segment{Literal: literal.String()})
 	}
 	return segments, nil
 }

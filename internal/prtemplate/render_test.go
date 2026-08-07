@@ -181,6 +181,22 @@ func TestRender_RequiredSectionTruncatesInsteadOfShedding(t *testing.T) {
 	}
 }
 
+// TestRender_EscapedLiteralBraceSurvivesRenderingUntouched proves the escape
+// hatch survives the full pipeline, not just parsing: a literal "{{" from an
+// escaped opener publishes verbatim through RenderSegments, with no code path
+// treating it as a placeholder or corrupting it during elision.
+func TestRender_EscapedLiteralBraceSurvivesRenderingUntouched(t *testing.T) {
+	segments, err := parseSegments(`Literal \{{ shows up }} verbatim: {{ subject }}`, "s")
+	if err != nil {
+		t.Fatalf("parseSegments: %v", err)
+	}
+	got := RenderSegments(segments, map[string]*string{"s_1": strptr("done")})
+	want := "Literal {{ shows up }} verbatim: done"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func mustParse(t *testing.T, text, prefix string) []Segment {
 	t.Helper()
 	segs, err := parseSegments(text, prefix)
