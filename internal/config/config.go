@@ -86,6 +86,10 @@ type GlobalConfig struct {
 	Commit CommitRaw
 	Intent IntentRaw
 	Test   TestRaw
+	// PR is the operator's own pr: floor/default. Like Document and Review,
+	// it is trusted-only end to end (see EffectiveRepoConfig): a repo whose
+	// trusted copy configures nothing inherits this value.
+	PR PRRaw
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -106,6 +110,7 @@ type globalConfigRaw struct {
 	Commit               CommitRaw           `yaml:"commit"`
 	Intent               IntentRaw           `yaml:"intent"`
 	Test                 TestRaw             `yaml:"test"`
+	PR                   PRRaw               `yaml:"pr"`
 }
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
@@ -161,6 +166,14 @@ type RepoConfig struct {
 	// registered pending or failing check. No inference from workflow files,
 	// prior history, branch names, or grace-period expiry.
 	NoCI bool `yaml:"no_ci"`
+	// PR carries the repository's PR title/description template, labels,
+	// draft state, and agent-failure posture. The whole namespace is
+	// trusted-only (see EffectiveRepoConfig and Decision 6 in the design):
+	// pr.sections[].content is natural-language text injected into a gate
+	// agent's prompt (a prompt-injection surface), pr.title.must_match
+	// decides whether a run fails, and pr.labels writes to the forge - a
+	// contributor's pushed branch must not control any of them.
+	PR PRRaw `yaml:"pr"`
 }
 
 // DocumentRaw is the YAML representation of document-step settings.
@@ -303,6 +316,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 		Review                 ReviewRaw   `yaml:"review"`
 		DisableProjectSettings bool        `yaml:"disable_project_settings"`
 		NoCI                   bool        `yaml:"no_ci"`
+		PR                     PRRaw       `yaml:"pr"`
 	}
 	var raw repoConfigRaw
 	if err := value.Decode(&raw); err != nil {
@@ -322,6 +336,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.Review = raw.Review
 	c.DisableProjectSettings = raw.DisableProjectSettings
 	c.NoCI = raw.NoCI
+	c.PR = raw.PR
 	return nil
 }
 
@@ -401,6 +416,10 @@ type Config struct {
 	// intentionally has no CI (see the RepoConfig field). When true and the
 	// forge reports zero checks, the CI monitor treats that as all-checks-passed.
 	NoCI bool
+	// PR is the resolved, trusted-only pr: config. Nil means neither level
+	// configured a title template or sections: the PR step must take this as
+	// "run the legacy composer, unmodified" - the config-absent guarantee.
+	PR *PR
 }
 
 // Document is the resolved document-step config. Instructions come from the
@@ -641,6 +660,34 @@ intent:
 #   evidence:
 #     store_in_repo: true
 #     dir: .no-mistakes/evidence
+
+# Configurable PR title/description template. Repo config may override this
+# value; the whole pr: namespace is trusted-only (read from the default
+# branch), regardless of allow_repo_commands. {{ bracketed text }} is a
+# natural-language instruction the drafting agent replaces with a concrete
+# value; sections must include exactly one of source: pipeline or
+# source: pipeline.summary (the evidence floor). See docs/reference/repo-config.md.
+# pr:
+#   title:
+#     template: "{{ Jira Ticket ID }}: {{ Overall PR title, imperative, no trailing period }}"
+#     max_chars: 100
+#     conventional: false
+#     strict: true
+#     must_match: '^[A-Z]{2,10}-[0-9]+: .+'
+#   labels: ["automated"]
+#   draft: false
+#   on_agent_failure: fallback
+#   sections:
+#     - id: whats_changed
+#       heading: "What's Changed"
+#       required: true
+#       max_chars: 1500
+#       content: |
+#         {{ 3-6 bullet points describing the concrete behavior and code
+#         changes in this branch, derived from the final diff. }}
+#     - source: pipeline.risk
+#     - source: pipeline.testing
+#     - source: pipeline.summary
 `
 
 // defaultBinary maps agent names to their default binary names.
@@ -1138,6 +1185,9 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 	if err := validateCommitRaw(raw.Commit); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
+	if err := validatePRRaw(raw.PR); err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
 
 	if len(raw.Agent) > 0 {
 		cfg.Agents = copyAgents(raw.Agent)
@@ -1199,6 +1249,7 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 	cfg.Commit = raw.Commit
 	cfg.Intent = raw.Intent
 	cfg.Test = raw.Test
+	cfg.PR = raw.PR
 
 	return cfg, nil
 }
@@ -1267,6 +1318,9 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
 	if err := validateReviewRaw(cfg.Review); err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
+	if err := validatePRRaw(cfg.PR); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
 	if cfg.AutoFix.CI == nil {
@@ -1395,12 +1449,19 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// billed to the repository. It is trusted-only for that reason, so a
 		// pushed branch cannot raise its own rerun budget to the cap.
 		effective.CI = trusted.CI
+		// pr: is trusted-only end to end (Decision 6): pr.sections[].content
+		// is a prompt-injection surface into the gate agent that drafts the
+		// PR, pr.title.must_match decides whether the run fails, and
+		// pr.labels writes to the forge. A pushed branch must control none
+		// of it, so it is sourced only from the trusted default-branch copy.
+		effective.PR = trusted.PR
 	} else {
 		effective.Document = DocumentRaw{}
 		effective.Review = ReviewRaw{}
 		effective.DisableProjectSettings = false
 		effective.NoCI = false
 		effective.CI = CIRaw{}
+		effective.PR = PRRaw{}
 	}
 	if allowRepoCommands {
 		return &effective
@@ -1619,6 +1680,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).
 		DisableProjectSettings: repo.DisableProjectSettings,
 		NoCI:                   repo.NoCI,
+		PR:                     resolvePROrFallback(global.PR, repo.PR),
 	}
 
 	if repo.Agent != "" {

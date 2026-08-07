@@ -213,6 +213,12 @@ Creates or updates a pull request.
 
 Stores the PR URL in the database and streams it to the TUI.
 
+### Configurable title and description
+
+Everything above describes the behavior with no `pr:` config. A repository (or your own global default) can instead configure `pr.title.template` and/or `pr.sections` to control the exact title format and which sections appear, in what order, in what shape - see [`pr` in the repo config reference](/no-mistakes/reference/repo-config/#pr) for the full schema.
+
+The drafting agent then answers with one value per placeholder rather than a whole markdown body; no-mistakes owns structure, order, headings, elision of unresolved placeholders, and truncation, so a configured template cannot forge a section break or leak an unfilled `{{ }}` into a published title or body. The signature and machine-readable attestation described below always render exactly as they do without a template: a configured `pr.sections` list must include exactly one of `source: pipeline` (signature, attestation, and the human-readable narrative) or `source: pipeline.summary` (signature and attestation only, no narrative) - omitting both is a config error, not a silent append.
+
 ### Pipeline step attestation
 
 Immediately after the existing `Updates from [git push no-mistakes](https://github.com/kunchenguid/no-mistakes)` signature, no-mistakes writes one stable HTML comment:
